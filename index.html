@@ -396,130 +396,165 @@ input[type=range]::-webkit-slider-thumb {
 
 <script>
 /* ══════════════════════════════════════════════════════
-   ▼▼▼  DROP YOUR KEYS IN HERE  ▼▼▼
+   CONFIG — keys are already injected
 ══════════════════════════════════════════════════════ */
 const CONFIG = {
-  // ACRCloud — from console.acrcloud.com → your project
   ACR_HOST:   'identify-eu-west-1.acrcloud.com',
   ACR_KEY:    '5333e5338fba12c16cde5eb6f566ff95',
   ACR_SECRET: 'zD7sKf2K0inK1Jd21mW1tCGNSai6TjtQFut0Xbum',
 
-  // Spotify — from developer.spotify.com/dashboard
   SPOTIFY_CLIENT_ID:    '11cacfa27cb4498197e0b64b16085105',
-  SPOTIFY_REDIRECT_URI: 'https://diskuskastaren.github.io/immersive/'
-  SPOTIFY_SCOPES:       'streaming user-read-email user-read-private user-modify-playback-state user-read-playback-state',
+  SPOTIFY_REDIRECT_URI: 'https://diskuskastaren.github.io/immersive/',
+  // No "streaming" scope — we remote-control the Spotify app, works on all mobile browsers
+  SPOTIFY_SCOPES: 'user-read-email user-read-private user-modify-playback-state user-read-playback-state',
 };
-/* ══════════════════════════════════════════════════════
-   ▲▲▲  END OF CONFIG  ▲▲▲
-══════════════════════════════════════════════════════ */
 
 /* ── State ── */
 let spotifyToken = null;
-let spotifyPlayer = null;
-let spotifyDeviceId = null;
-let mediaStream = null;
-let mediaRecorder = null;
-let isListening = false;
-let isSynced = false;
-let currentTrackUri = null;
+let mediaStream   = null;
+let isListening   = false;
+let isSynced      = false;
+let offsetMs      = 0;
 let progressInterval = null;
-let playerState = null;
-let offsetMs = 0;
+let activeDeviceId   = null;
 
 /* ══════════════════════════════
-   SPOTIFY AUTH
+   SPOTIFY AUTH (implicit grant — works on mobile)
 ══════════════════════════════ */
 function loginWithSpotify() {
   const params = new URLSearchParams({
-    client_id: CONFIG.SPOTIFY_CLIENT_ID,
+    client_id:     CONFIG.SPOTIFY_CLIENT_ID,
     response_type: 'token',
-    redirect_uri: CONFIG.SPOTIFY_REDIRECT_URI,
-    scope: CONFIG.SPOTIFY_SCOPES,
-    show_dialog: false,
+    redirect_uri:  CONFIG.SPOTIFY_REDIRECT_URI,
+    scope:         CONFIG.SPOTIFY_SCOPES,
+    show_dialog:   'false',
   });
   window.location.href = 'https://accounts.spotify.com/authorize?' + params.toString();
 }
 
 function getTokenFromHash() {
-  const hash = window.location.hash.substring(1);
-  const params = new URLSearchParams(hash);
+  const params = new URLSearchParams(window.location.hash.substring(1));
   return params.get('access_token');
 }
 
-function initSpotifySDK(token) {
-  return new Promise((resolve, reject) => {
-    window.onSpotifyWebPlaybackSDKReady = () => {
-      spotifyPlayer = new Spotify.Player({
-        name: 'Immersive',
-        getOAuthToken: cb => cb(token),
-        volume: 0.8,
-      });
+async function spotifyGet(path) {
+  const res = await fetch('https://api.spotify.com/v1' + path, {
+    headers: { Authorization: 'Bearer ' + spotifyToken },
+  });
+  if (res.status === 204) return null;
+  return res.json();
+}
 
-      spotifyPlayer.addListener('ready', ({ device_id }) => {
-        spotifyDeviceId = device_id;
-        resolve();
-      });
+async function spotifyPut(path, body) {
+  const res = await fetch('https://api.spotify.com/v1' + path, {
+    method: 'PUT',
+    headers: { Authorization: 'Bearer ' + spotifyToken, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res;
+}
 
-      spotifyPlayer.addListener('not_ready', () => {
-        showToast('Spotify player disconnected', true);
-      });
+async function fetchSpotifyUser() {
+  const data = await spotifyGet('/me');
+  return data?.display_name || data?.id || 'Connected';
+}
 
-      spotifyPlayer.addListener('player_state_changed', state => {
-        playerState = state;
-        if (state) updatePlaybackUI(state);
-      });
+/* Get the active Spotify device (the open Spotify app on phone/desktop) */
+async function getActiveDevice() {
+  const data = await spotifyGet('/me/player/devices');
+  if (!data?.devices?.length) return null;
+  // Prefer whichever device is currently active; else take the first
+  const active = data.devices.find(d => d.is_active) || data.devices[0];
+  return active?.id || null;
+}
 
-      spotifyPlayer.addListener('initialization_error', ({ message }) => reject(message));
-      spotifyPlayer.addListener('authentication_error', ({ message }) => reject(message));
-      spotifyPlayer.addListener('account_error', () => {
-        showToast('Spotify Premium required', true);
-        reject('Premium required');
-      });
+/* Remote-control the Spotify app to play a track at a position */
+async function playTrackRemote(uri, positionMs) {
+  // Refresh device id each time in case user switched device
+  activeDeviceId = await getActiveDevice();
 
-      spotifyPlayer.connect();
-    };
+  if (!activeDeviceId) {
+    throw new Error('No Spotify device found — open the Spotify app first');
+  }
 
-    // Load SDK
-    const script = document.createElement('script');
-    script.src = 'https://sdk.scdn.co/spotify-player.js';
-    document.head.appendChild(script);
+  const res = await spotifyPut(
+    `/me/player/play?device_id=${activeDeviceId}`,
+    { uris: [uri], position_ms: Math.max(0, positionMs) }
+  );
+
+  if (res.status === 403) throw new Error('Spotify Premium required');
+  if (res.status === 404) throw new Error('No active Spotify device — open the app and play something first');
+  if (!res.ok) throw new Error('Spotify playback error ' + res.status);
+}
+
+async function togglePlayPause() {
+  const state = await spotifyGet('/me/player');
+  if (!state) return;
+  if (state.is_playing) {
+    await fetch('https://api.spotify.com/v1/me/player/pause', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + spotifyToken },
+    });
+    document.getElementById('playPauseBtn').textContent = '▶';
+  } else {
+    await fetch('https://api.spotify.com/v1/me/player/play', {
+      method: 'PUT', headers: { Authorization: 'Bearer ' + spotifyToken },
+    });
+    document.getElementById('playPauseBtn').textContent = '⏸';
+  }
+}
+
+async function seekRelative(seconds) {
+  const state = await spotifyGet('/me/player');
+  if (!state) return;
+  const newPos = (state.progress_ms || 0) + seconds * 1000;
+  await fetch(`https://api.spotify.com/v1/me/player/seek?position_ms=${Math.max(0, newPos)}`, {
+    method: 'PUT', headers: { Authorization: 'Bearer ' + spotifyToken },
   });
 }
 
-async function fetchSpotifyUser(token) {
-  const res = await fetch('https://api.spotify.com/v1/me', {
-    headers: { Authorization: 'Bearer ' + token }
-  });
-  const data = await res.json();
-  return data.display_name || data.id || 'Connected';
+function applyOffset(val) {
+  offsetMs = parseInt(val);
+  document.getElementById('delayVal').textContent = (offsetMs > 0 ? '+' : '') + offsetMs + ' ms';
+}
+
+function startProgressPoll() {
+  clearInterval(progressInterval);
+  progressInterval = setInterval(async () => {
+    const state = await spotifyGet('/me/player');
+    if (!state) return;
+    const pos = state.progress_ms || 0;
+    const dur = state.item?.duration_ms || 0;
+    document.getElementById('progressFill').style.width = dur ? (pos / dur * 100) + '%' : '0%';
+    document.getElementById('timeElapsed').textContent = msToTime(pos);
+    document.getElementById('timeDuration').textContent = msToTime(dur);
+    document.getElementById('playPauseBtn').textContent = state.is_playing ? '⏸' : '▶';
+  }, 2000);
+}
+
+function msToTime(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
 /* ══════════════════════════════
    ACRCloud RECOGNITION
 ══════════════════════════════ */
 function buildAcrSignature(timestamp) {
-  const stringToSign = ['POST', '/v1/identify', CONFIG.ACR_KEY, 'audio', '1', timestamp].join('\n');
-  const signature = CryptoJS.HmacSHA1(stringToSign, CONFIG.ACR_SECRET);
-  return CryptoJS.enc.Base64.stringify(signature);
+  const str = ['POST', '/v1/identify', CONFIG.ACR_KEY, 'audio', '1', timestamp].join('\n');
+  return CryptoJS.enc.Base64.stringify(CryptoJS.HmacSHA1(str, CONFIG.ACR_SECRET));
 }
 
-async function recogniseAudio(audioBlob) {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const signature = buildAcrSignature(timestamp);
-
+async function recogniseAudio(blob) {
+  const ts = Math.floor(Date.now() / 1000);
   const form = new FormData();
-  form.append('sample', audioBlob, 'sample.wav');
+  form.append('sample', blob, 'sample.wav');
   form.append('access_key', CONFIG.ACR_KEY);
   form.append('data_type', 'audio');
   form.append('signature_version', '1');
-  form.append('signature', signature);
-  form.append('sample_bytes', audioBlob.size);
-  form.append('timestamp', timestamp);
-
-  const res = await fetch(`https://${CONFIG.ACR_HOST}/v1/identify`, {
-    method: 'POST',
-    body: form,
-  });
+  form.append('signature', buildAcrSignature(ts));
+  form.append('sample_bytes', blob.size);
+  form.append('timestamp', ts);
+  const res = await fetch(`https://${CONFIG.ACR_HOST}/v1/identify`, { method: 'POST', body: form });
   return res.json();
 }
 
@@ -532,195 +567,116 @@ async function startMic() {
 }
 
 function stopMic() {
-  if (mediaStream) {
-    mediaStream.getTracks().forEach(t => t.stop());
-    mediaStream = null;
-  }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
 }
 
-function recordChunk(stream, durationMs = 8000) {
+function recordChunk(stream, ms = 8000) {
   return new Promise((resolve, reject) => {
-    // Prefer wav-friendly formats; fallback gracefully
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus'
-      : MediaRecorder.isTypeSupported('audio/mp4')
-        ? 'audio/mp4'
-        : 'audio/webm';
-
-    const recorder = new MediaRecorder(stream, { mimeType });
+    const mime = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+      .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
     const chunks = [];
-    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
-    recorder.onerror = e => reject(e);
-    recorder.start();
-    setTimeout(() => recorder.stop(), durationMs);
+    rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    rec.onstop = () => resolve(new Blob(chunks, { type: mime || 'audio/webm' }));
+    rec.onerror = reject;
+    rec.start();
+    setTimeout(() => rec.stop(), ms);
   });
 }
 
 /* ══════════════════════════════
-   SPOTIFY PLAYBACK
-══════════════════════════════ */
-async function playTrack(uri, positionMs = 0) {
-  await fetch(`https://api.spotify.com/v1/me/player/play?device_id=${spotifyDeviceId}`, {
-    method: 'PUT',
-    headers: {
-      Authorization: 'Bearer ' + spotifyToken,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ uris: [uri], position_ms: Math.max(0, positionMs) }),
-  });
-}
-
-async function togglePlayPause() {
-  if (!spotifyPlayer) return;
-  await spotifyPlayer.togglePlay();
-}
-
-async function seekRelative(seconds) {
-  if (!playerState) return;
-  const pos = playerState.position + (seconds * 1000);
-  await spotifyPlayer.seek(Math.max(0, pos));
-}
-
-function applyOffset(val) {
-  offsetMs = parseInt(val);
-  document.getElementById('delayVal').textContent = (offsetMs > 0 ? '+' : '') + offsetMs + ' ms';
-  // Re-seek with new offset if currently playing
-  if (isSynced && playerState && !playerState.paused) {
-    spotifyPlayer.getCurrentState().then(state => {
-      if (state) spotifyPlayer.seek(Math.max(0, state.position + offsetMs));
-    });
-  }
-}
-
-function updatePlaybackUI(state) {
-  if (!state) return;
-  const track = state.track_window?.current_track;
-  if (!track) return;
-
-  // Progress
-  const pos = state.position;
-  const dur = state.duration;
-  document.getElementById('progressFill').style.width = dur ? (pos / dur * 100) + '%' : '0%';
-  document.getElementById('timeElapsed').textContent = msToTime(pos);
-  document.getElementById('timeDuration').textContent = msToTime(dur);
-  document.getElementById('playPauseBtn').textContent = state.paused ? '▶' : '⏸';
-}
-
-function msToTime(ms) {
-  const s = Math.floor(ms / 1000);
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-
-/* ══════════════════════════════
-   MAIN LISTEN FLOW
+   MAIN FLOW
 ══════════════════════════════ */
 async function toggleListen() {
-  if (isListening) {
-    stopListening();
-  } else {
-    await startListening();
-  }
+  isListening ? stopListening() : await startListening();
 }
 
 async function startListening() {
   isListening = true;
-  setListeningUI(true);
+  setBtnState('listening');
 
   try {
     const stream = await startMic();
-    setWaveState('listening', 'Listening…', 'Detecting track from speakers');
+    setWave('on', 'Listening…', 'Detecting track from speakers');
 
-    const audioBlob = await recordChunk(stream, 8000);
-    setWaveState('listening', 'Identifying…', 'Matching against music database');
+    const blob = await recordChunk(stream, 8000);
+    setWave('on', 'Identifying…', 'Matching against music database');
 
-    const result = await recogniseAudio(audioBlob);
+    const result = await recogniseAudio(blob);
+    stopMic();
 
-    if (result.status?.code !== 0) {
-      throw new Error(result.status?.msg || 'Track not recognised');
-    }
+    if (result.status?.code !== 0) throw new Error(result.status?.msg || 'Track not recognised — try again');
 
     const music = result.metadata?.music?.[0];
     if (!music) throw new Error('No track found — try again');
 
-    const title = music.title;
-    const artist = music.artists?.[0]?.name || 'Unknown';
-    const spotifyUri = music.external_metadata?.spotify?.track?.id
-      ? `spotify:track:${music.external_metadata.spotify.track.id}`
-      : null;
-    const albumArt = music.album?.cover_url_large || music.album?.cover_url || null;
-    const playOffsetMs = (music.played_duration || 0) * 1000;
+    const title     = music.title;
+    const artist    = music.artists?.[0]?.name || 'Unknown';
+    const trackId   = music.external_metadata?.spotify?.track?.id;
+    const albumArt  = music.album?.cover_url_large || music.album?.cover_url || null;
+    const detectedPositionMs = (music.played_duration || 0) * 1000;
 
-    if (!spotifyUri) throw new Error(`"${title}" found but not on Spotify`);
+    if (!trackId) throw new Error(`"${title}" found but not available on Spotify`);
+    const uri = `spotify:track:${trackId}`;
 
-    // Update UI
-    document.getElementById('npTitle').textContent = title;
+    // Update now-playing card
+    document.getElementById('npTitle').textContent  = title;
     document.getElementById('npArtist').textContent = artist;
-    const artEl = document.getElementById('npArt');
-    artEl.innerHTML = albumArt
+    document.getElementById('npArt').innerHTML = albumArt
       ? `<img src="${albumArt}" alt="Album art">`
       : `<div class="np-art-placeholder">🎵</div>`;
-    document.getElementById('npSyncLabel').textContent = `synced · +${playOffsetMs}ms offset`;
+    document.getElementById('npSyncLabel').textContent = `synced · ${detectedPositionMs}ms in`;
 
-    setWaveState('synced', 'Synced', `${title} — ${artist}`);
+    setWave('on', 'Synced', `${title} — ${artist}`);
     document.getElementById('nowPlaying').classList.add('visible');
     document.getElementById('playbackControls').classList.add('visible');
     document.getElementById('delayRow').classList.add('visible');
 
-    currentTrackUri = spotifyUri;
     isSynced = true;
-
-    // Play on Spotify at detected position + offset
-    await playTrack(spotifyUri, playOffsetMs + offsetMs);
-
-    stopMic();
-    setListeningUI(false);
     isListening = false;
+    setBtnState('idle');
 
-    // Start progress polling
+    // Remote-control the Spotify app
+    await playTrackRemote(uri, detectedPositionMs + offsetMs);
     startProgressPoll();
 
   } catch (err) {
     stopMic();
-    stopListening();
+    isListening = false;
+    setBtnState('idle');
+    if (!isSynced) setWave('off', 'Ready', 'Point phone toward speakers, then tap');
     showToast(err.message || 'Something went wrong', true);
-    setWaveState('idle', 'Ready', 'Point phone toward speakers, then tap');
   }
 }
 
 function stopListening() {
   isListening = false;
   stopMic();
-  setListeningUI(false);
-  if (!isSynced) {
-    setWaveState('idle', 'Ready', 'Point phone toward speakers, then tap');
+  setBtnState('idle');
+  if (!isSynced) setWave('off', 'Ready', 'Point phone toward speakers, then tap');
+}
+
+function setBtnState(state) {
+  const btn  = document.getElementById('listenBtn');
+  const text = document.getElementById('btnText');
+  btn.disabled = false;
+  if (state === 'listening') {
+    btn.classList.add('listening');
+    text.innerHTML = '<div class="spinner"></div> Listening…';
+  } else {
+    btn.classList.remove('listening');
+    text.textContent = isSynced ? 'Listen again' : 'Start listening';
   }
 }
 
-function setListeningUI(on) {
-  const btn = document.getElementById('listenBtn');
-  const btnText = document.getElementById('btnText');
-  btn.classList.toggle('listening', on);
-  btnText.innerHTML = on ? '<div class="spinner"></div> Listening…' : 'Start listening';
-  btn.disabled = false;
-}
-
-function setWaveState(state, label, sub) {
-  const bars = document.querySelectorAll('.wave-bar');
-  bars.forEach(b => { b.classList.remove('active', 'error'); });
-  if (state === 'listening' || state === 'synced') bars.forEach(b => b.classList.add('active'));
-  if (state === 'error') bars.forEach(b => b.classList.add('error'));
+function setWave(state, label, sub) {
+  document.querySelectorAll('.wave-bar').forEach(b => {
+    b.classList.remove('active', 'error');
+    if (state === 'on') b.classList.add('active');
+    if (state === 'error') b.classList.add('error');
+  });
   document.getElementById('waveLabel').textContent = label;
-  document.getElementById('waveSub').textContent = sub;
-}
-
-function startProgressPoll() {
-  clearInterval(progressInterval);
-  progressInterval = setInterval(async () => {
-    if (!spotifyPlayer) return;
-    const state = await spotifyPlayer.getCurrentState();
-    if (state) updatePlaybackUI(state);
-  }, 1000);
+  document.getElementById('waveSub').textContent   = sub;
 }
 
 /* ══════════════════════════════
@@ -732,34 +688,30 @@ function showToast(msg, isError = false) {
   t.textContent = msg;
   t.className = 'toast show' + (isError ? ' error' : '');
   clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => { t.className = 'toast'; }, 3500);
+  toastTimeout = setTimeout(() => { t.className = 'toast'; }, 4000);
 }
 
 /* ══════════════════════════════
    BOOT
 ══════════════════════════════ */
 async function boot() {
-  // Check for Spotify token in URL hash (after OAuth redirect)
   const token = getTokenFromHash();
   if (token) {
     window.history.replaceState({}, document.title, window.location.pathname);
     spotifyToken = token;
-
     showView('main');
+
     document.getElementById('listenBtn').disabled = true;
-    document.getElementById('btnText').innerHTML = '<div class="spinner"></div> Connecting…';
+    document.getElementById('btnText').innerHTML = '<div class="spinner dark"></div> Connecting…';
 
     try {
-      const [username] = await Promise.all([
-        fetchSpotifyUser(token),
-        initSpotifySDK(token),
-      ]);
+      const username = await fetchSpotifyUser();
       document.getElementById('spotifyUser').textContent = username;
       document.getElementById('listenBtn').disabled = false;
       document.getElementById('btnText').textContent = 'Start listening';
       showToast('Connected to Spotify ✓');
     } catch (e) {
-      showToast('Spotify connection failed — try again', true);
+      showToast('Connection failed — try again', true);
       showView('login');
     }
   } else {
