@@ -421,20 +421,69 @@ let activeDeviceId   = null;
 /* ══════════════════════════════
    SPOTIFY AUTH (implicit grant — works on mobile)
 ══════════════════════════════ */
-function loginWithSpotify() {
+/* ── PKCE helpers ── */
+function generateRandomString(length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const arr = new Uint8Array(length);
+  crypto.getRandomValues(arr);
+  return Array.from(arr).map(x => chars[x % chars.length]).join('');
+}
+
+async function generateCodeChallenge(verifier) {
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function loginWithSpotify() {
+  const verifier  = generateRandomString(64);
+  const challenge = await generateCodeChallenge(verifier);
+  sessionStorage.setItem('pkce_verifier', verifier);
+
   const params = new URLSearchParams({
-    client_id:     CONFIG.SPOTIFY_CLIENT_ID,
-    response_type: 'token',
-    redirect_uri:  CONFIG.SPOTIFY_REDIRECT_URI,
-    scope:         CONFIG.SPOTIFY_SCOPES,
-    show_dialog:   'false',
+    client_id:             CONFIG.SPOTIFY_CLIENT_ID,
+    response_type:         'code',
+    redirect_uri:          CONFIG.SPOTIFY_REDIRECT_URI,
+    scope:                 CONFIG.SPOTIFY_SCOPES,
+    code_challenge_method: 'S256',
+    code_challenge:        challenge,
   });
   window.location.href = 'https://accounts.spotify.com/authorize?' + params.toString();
 }
 
-function getTokenFromHash() {
-  const params = new URLSearchParams(window.location.hash.substring(1));
-  return params.get('access_token');
+async function exchangeCodeForToken(code) {
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const res = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id:     CONFIG.SPOTIFY_CLIENT_ID,
+      grant_type:    'authorization_code',
+      code,
+      redirect_uri:  CONFIG.SPOTIFY_REDIRECT_URI,
+      code_verifier: verifier,
+    }),
+  });
+  if (!res.ok) throw new Error('Token exchange failed');
+  const data = await res.json();
+  sessionStorage.removeItem('pkce_verifier');
+  // Store token + expiry
+  sessionStorage.setItem('spotify_token', data.access_token);
+  sessionStorage.setItem('spotify_token_expiry', Date.now() + data.expires_in * 1000);
+  return data.access_token;
+}
+
+function getStoredToken() {
+  const token  = sessionStorage.getItem('spotify_token');
+  const expiry = parseInt(sessionStorage.getItem('spotify_token_expiry') || '0');
+  if (token && Date.now() < expiry - 30000) return token;
+  return null;
+}
+
+function getCodeFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('code');
 }
 
 async function spotifyGet(path) {
@@ -695,26 +744,46 @@ function showToast(msg, isError = false) {
    BOOT
 ══════════════════════════════ */
 async function boot() {
-  const token = getTokenFromHash();
-  if (token) {
-    window.history.replaceState({}, document.title, window.location.pathname);
-    spotifyToken = token;
-    showView('main');
+  // 1) Already have a valid token in session?
+  const stored = getStoredToken();
+  if (stored) {
+    spotifyToken = stored;
+    return enterApp();
+  }
 
+  // 2) Returning from Spotify OAuth with ?code=
+  const code = getCodeFromUrl();
+  if (code) {
+    window.history.replaceState({}, document.title, window.location.pathname);
+    showView('main');
     document.getElementById('listenBtn').disabled = true;
     document.getElementById('btnText').innerHTML = '<div class="spinner dark"></div> Connecting…';
-
     try {
-      const username = await fetchSpotifyUser();
-      document.getElementById('spotifyUser').textContent = username;
-      document.getElementById('listenBtn').disabled = false;
-      document.getElementById('btnText').textContent = 'Start listening';
-      showToast('Connected to Spotify ✓');
+      spotifyToken = await exchangeCodeForToken(code);
+      await enterApp();
     } catch (e) {
-      showToast('Connection failed — try again', true);
+      showToast('Auth failed — try again', true);
       showView('login');
     }
-  } else {
+    return;
+  }
+
+  // 3) Not logged in
+  showView('login');
+}
+
+async function enterApp() {
+  showView('main');
+  document.getElementById('listenBtn').disabled = true;
+  document.getElementById('btnText').innerHTML = '<div class="spinner dark"></div> Connecting…';
+  try {
+    const username = await fetchSpotifyUser();
+    document.getElementById('spotifyUser').textContent = username;
+    document.getElementById('listenBtn').disabled = false;
+    document.getElementById('btnText').textContent = 'Start listening';
+    showToast('Connected to Spotify ✓');
+  } catch (e) {
+    showToast('Connection failed — try again', true);
     showView('login');
   }
 }
