@@ -508,14 +508,72 @@ async function fetchSpotifyUser() {
   return data?.display_name || data?.id || 'Connected';
 }
 
-/* Get the active Spotify device (the open Spotify app on phone/desktop) */
-async function getActiveDevice() {
+/* Get devices and let user pick if multiple found */
+let devices = [];
+
+async function fetchDevices() {
   const data = await spotifyGet('/me/player/devices');
-  if (!data?.devices?.length) return null;
-  // Prefer whichever device is currently active; else take the first
-  const active = data.devices.find(d => d.is_active) || data.devices[0];
-  return active?.id || null;
+  devices = data?.devices || [];
+  return devices;
 }
+
+async function getActiveDevice() {
+  await fetchDevices();
+  if (!devices.length) throw new Error('No Spotify device found — open the Spotify app first');
+  
+  // If only one device, use it
+  if (devices.length === 1) return devices[0].id;
+  
+  // If there's an active one that's a phone/tablet, prefer it
+  const mobileActive = devices.find(d => d.is_active && (d.type === 'Smartphone' || d.type === 'Tablet'));
+  if (mobileActive) return mobileActive.id;
+
+  // Otherwise show picker
+  return await showDevicePicker(devices);
+}
+
+function showDevicePicker(devs) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:200;display:flex;align-items:flex-end;padding:16px;box-sizing:border-box;';
+    
+    const icons = { Smartphone: '📱', Computer: '💻', Speaker: '🔊', Tablet: '📱', TV: '📺', GameConsole: '🎮' };
+    
+    const sheet = document.createElement('div');
+    sheet.style.cssText = 'background:#fff;border-radius:20px;width:100%;padding:20px;font-family:DM Sans,sans-serif;';
+    sheet.innerHTML = `
+      <div style="font-size:13px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#888;margin-bottom:14px;">Play on…</div>
+      ${devs.map((d,i) => `
+        <div onclick="pickDevice(${i})" style="display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid #f0f0f0;cursor:pointer;">
+          <span style="font-size:22px">${icons[d.type] || '🎵'}</span>
+          <div>
+            <div style="font-size:14px;font-weight:500;color:#0f0f0f">${d.name}</div>
+            <div style="font-size:12px;color:#888">${d.type}${d.is_active ? ' · active' : ''}</div>
+          </div>
+          ${d.is_active ? '<div style="margin-left:auto;width:8px;height:8px;border-radius:50%;background:#1DB954"></div>' : ''}
+        </div>
+      `).join('')}
+      <button onclick="cancelDevicePicker()" style="width:100%;margin-top:14px;padding:14px;border:1px solid #e8e8e8;border-radius:12px;background:none;font-size:14px;font-family:inherit;cursor:pointer;color:#888;">Cancel</button>
+    `;
+    overlay.appendChild(sheet);
+    document.body.appendChild(overlay);
+    
+    window._devicePickerResolve = resolve;
+    window._devicePickerOverlay = overlay;
+    window._devicePickerDevices = devs;
+  });
+}
+
+window.pickDevice = function(index) {
+  const id = window._devicePickerDevices[index].id;
+  window._devicePickerOverlay.remove();
+  window._devicePickerResolve(id);
+};
+
+window.cancelDevicePicker = function() {
+  window._devicePickerOverlay.remove();
+  window._devicePickerResolve(null);
+};
 
 /* Remote-control the Spotify app to play a track at a position */
 async function playTrackRemote(uri, positionMs) {
@@ -523,7 +581,7 @@ async function playTrackRemote(uri, positionMs) {
   activeDeviceId = await getActiveDevice();
 
   if (!activeDeviceId) {
-    throw new Error('No Spotify device found — open the Spotify app first');
+    throw new Error('No device selected — cancelled');
   }
 
   const res = await spotifyPut(
@@ -663,7 +721,10 @@ async function startListening() {
     const artist    = music.artists?.[0]?.name || 'Unknown';
     const trackId   = music.external_metadata?.spotify?.track?.id;
     const albumArt  = music.album?.cover_url_large || music.album?.cover_url || null;
-    const detectedPositionMs = (music.played_duration || 0) * 1000;
+    // played_duration = position in track where our 8s sample started
+    // Add recording duration to get current real-world position
+    const recordingDurationMs = 8000;
+    const detectedPositionMs = ((music.played_duration || 0) * 1000) + recordingDurationMs;
 
     if (!trackId) throw new Error(`"${title}" found but not available on Spotify`);
     const uri = `spotify:track:${trackId}`;
