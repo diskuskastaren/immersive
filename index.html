@@ -706,10 +706,14 @@ async function startListening() {
     const stream = await startMic();
     setWave('on', 'Listening…', 'Detecting track from speakers');
 
+    // ── Timing: stamp exactly when recording starts ──
+    const recordingStartedAt = Date.now();
     const blob = await recordChunk(stream, 8000);
     setWave('on', 'Identifying…', 'Matching against music database');
 
     const result = await recogniseAudio(blob);
+    // ── Stamp when we got the result back ──
+    const resultReceivedAt = Date.now();
     stopMic();
 
     if (result.status?.code !== 0) throw new Error(result.status?.msg || 'Track not recognised — try again');
@@ -717,14 +721,18 @@ async function startListening() {
     const music = result.metadata?.music?.[0];
     if (!music) throw new Error('No track found — try again');
 
-    const title     = music.title;
-    const artist    = music.artists?.[0]?.name || 'Unknown';
-    const trackId   = music.external_metadata?.spotify?.track?.id;
-    const albumArt  = music.album?.cover_url_large || music.album?.cover_url || null;
-    // played_duration = position in track where our 8s sample started
-    // Add recording duration to get current real-world position
-    const recordingDurationMs = 8000;
-    const detectedPositionMs = ((music.played_duration || 0) * 1000) + recordingDurationMs;
+    const title    = music.title;
+    const artist   = music.artists?.[0]?.name || 'Unknown';
+    const trackId  = music.external_metadata?.spotify?.track?.id;
+    const albumArt = music.album?.cover_url_large || music.album?.cover_url || null;
+
+    // played_duration = position in the track when our sample STARTED recording
+    // To get current position: add the full elapsed time since recording began
+    const playedDurationMs   = (music.played_duration || 0) * 1000;
+    const elapsedSinceStart  = resultReceivedAt - recordingStartedAt;
+    const detectedPositionMs = playedDurationMs + elapsedSinceStart;
+    
+    console.log('played_duration:', playedDurationMs, 'elapsed:', elapsedSinceStart, 'final pos:', detectedPositionMs);
 
     if (!trackId) throw new Error(`"${title}" found but not available on Spotify`);
     const uri = `spotify:track:${trackId}`;
@@ -735,7 +743,9 @@ async function startListening() {
     document.getElementById('npArt').innerHTML = albumArt
       ? `<img src="${albumArt}" alt="Album art">`
       : `<div class="np-art-placeholder">🎵</div>`;
-    document.getElementById('npSyncLabel').textContent = `synced · ${detectedPositionMs}ms in`;
+    const mins = Math.floor(detectedPositionMs / 60000);
+    const secs = Math.floor((detectedPositionMs % 60000) / 1000);
+    document.getElementById('npSyncLabel').textContent = `synced · seeking to ${mins}:${String(secs).padStart(2,'0')}`;
 
     setWave('on', 'Synced', `${title} — ${artist}`);
     document.getElementById('nowPlaying').classList.add('visible');
