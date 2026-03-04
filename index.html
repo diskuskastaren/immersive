@@ -644,6 +644,102 @@ function msToTime(ms) {
 }
 
 /* ══════════════════════════════
+   AUDIO CROSS-CORRELATION
+   Finds where our mic recording matches within the Spotify preview
+══════════════════════════════ */
+async function findPositionViaPreview(micBlob, previewUrl, elapsedMs) {
+  const audioCtx = new AudioContext();
+
+  // Decode both buffers in parallel via a CORS proxy since preview URLs are cross-origin
+  const [micBuffer, previewBuffer] = await Promise.all([
+    decodeBlob(audioCtx, micBlob),
+    fetchAndDecode(audioCtx, previewUrl),
+  ]);
+
+  // Downsample both to mono at 8kHz for fast correlation
+  const sampleRate = 8000;
+  const micMono    = downsampleToMono(audioCtx, micBuffer, sampleRate);
+  const prevMono   = downsampleToMono(audioCtx, previewBuffer, sampleRate);
+
+  // Cross-correlate: slide micMono over prevMono, find best match offset
+  const micLen  = micMono.length;
+  const prevLen = prevMono.length;
+  let bestOffset = 0;
+  let bestScore  = -Infinity;
+
+  // Only check offsets up to (preview - mic) length
+  const maxOffset = prevLen - micLen;
+  if (maxOffset <= 0) throw new Error('Preview too short for correlation');
+
+  // Step every 0.25s worth of samples for speed
+  const step = Math.floor(sampleRate * 0.25);
+
+  for (let offset = 0; offset <= maxOffset; offset += step) {
+    let score = 0;
+    for (let i = 0; i < micLen; i++) {
+      score += micMono[i] * prevMono[offset + i];
+    }
+    if (score > bestScore) { bestScore = score; bestOffset = offset; }
+  }
+
+  // Fine-tune around best offset (±1s)
+  const fineRange = sampleRate;
+  const fineStart = Math.max(0, bestOffset - fineRange);
+  const fineEnd   = Math.min(maxOffset, bestOffset + fineRange);
+  for (let offset = fineStart; offset <= fineEnd; offset++) {
+    let score = 0;
+    for (let i = 0; i < micLen; i++) {
+      score += micMono[i] * prevMono[offset + i];
+    }
+    if (score > bestScore) { bestScore = score; bestOffset = offset; }
+  }
+
+  audioCtx.close();
+
+  // bestOffset = samples into preview where our recording starts
+  // Add elapsed time to get current position
+  const positionInPreviewMs = (bestOffset / sampleRate) * 1000;
+  return positionInPreviewMs + elapsedMs;
+}
+
+function decodeBlob(ctx, blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => ctx.decodeAudioData(e.target.result).then(resolve).catch(reject);
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+async function fetchAndDecode(ctx, url) {
+  // Use a CORS proxy to fetch the preview MP3
+  const proxy = 'https://corsproxy.io/?' + encodeURIComponent(url);
+  const res = await fetch(proxy);
+  if (!res.ok) throw new Error('Could not fetch preview');
+  const buf = await res.arrayBuffer();
+  return ctx.decodeAudioData(buf);
+}
+
+function downsampleToMono(ctx, buffer, targetRate) {
+  // Mix down to mono
+  const numChannels = buffer.numberOfChannels;
+  const srcLen = buffer.length;
+  const mono = new Float32Array(srcLen);
+  for (let c = 0; c < numChannels; c++) {
+    const ch = buffer.getChannelData(c);
+    for (let i = 0; i < srcLen; i++) mono[i] += ch[i] / numChannels;
+  }
+  // Downsample
+  const ratio     = buffer.sampleRate / targetRate;
+  const outLen    = Math.floor(srcLen / ratio);
+  const out       = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    out[i] = mono[Math.floor(i * ratio)];
+  }
+  return out;
+}
+
+/* ══════════════════════════════
    ACRCloud RECOGNITION
 ══════════════════════════════ */
 function buildAcrSignature(timestamp) {
@@ -712,7 +808,6 @@ async function startListening() {
     setWave('on', 'Identifying…', 'Matching against music database');
 
     const result = await recogniseAudio(blob);
-    // ── Stamp when we got the result back ──
     const resultReceivedAt = Date.now();
     stopMic();
 
@@ -726,13 +821,30 @@ async function startListening() {
     const trackId  = music.external_metadata?.spotify?.track?.id;
     const albumArt = music.album?.cover_url_large || music.album?.cover_url || null;
 
-    // played_duration = position in the track when our sample STARTED recording
-    // To get current position: add the full elapsed time since recording began
-    const playedDurationMs   = (music.played_duration || 0) * 1000;
-    const elapsedSinceStart  = resultReceivedAt - recordingStartedAt;
-    const detectedPositionMs = playedDurationMs + elapsedSinceStart;
-    
-    console.log('played_duration:', playedDurationMs, 'elapsed:', elapsedSinceStart, 'final pos:', detectedPositionMs);
+
+
+    // ── Step 2: get track info + preview URL from Spotify ──
+    setWave('on', 'Syncing…', 'Finding exact position in track');
+    const trackInfo = await spotifyGet(`/tracks/${trackId}`);
+    const previewUrl = trackInfo?.preview_url;
+    const trackDurationMs = trackInfo?.duration_ms || 0;
+
+    let detectedPositionMs = 0;
+
+    if (previewUrl) {
+      try {
+        // Cross-correlate our recording against the 30s preview to find position
+        detectedPositionMs = await findPositionViaPreview(blob, previewUrl, resultReceivedAt - recordingStartedAt);
+        console.log('Position via preview cross-correlation:', detectedPositionMs);
+      } catch(e) {
+        console.warn('Preview correlation failed, falling back to elapsed time:', e);
+        detectedPositionMs = resultReceivedAt - recordingStartedAt;
+      }
+    } else {
+      // No preview available — best we can do is elapsed time (will be ~9-10s, not great)
+      detectedPositionMs = resultReceivedAt - recordingStartedAt;
+      console.warn('No preview URL — using elapsed time only');
+    }
 
     if (!trackId) throw new Error(`"${title}" found but not available on Spotify`);
     const uri = `spotify:track:${trackId}`;
